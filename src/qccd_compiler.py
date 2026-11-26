@@ -2675,6 +2675,7 @@ class QCCDCompiler:
         initial_placement: Dict[int, int],
         partition: Optional[StabilizerPartition] = None,
         initial_phonons: Optional[dict] = None,
+        initial_clock_us: Optional[float] = None,
     ) -> CompileResult:
         """
         Args:
@@ -2685,20 +2686,31 @@ class QCCDCompiler:
                 {'axial': {ion: v}, 'transversal': {...}, 'transversal2': {...}}
                 形式 (= 前 CompileResult の phonon_data['per_ion_*'])。
                 None なら従来通り全イオン 0 から開始 (ラウンド境界リセット)。
+            initial_clock_us: 計画時近似時計の初期値 [μs] (opt-in)。
+                前 CompileResult の phonon_data['planning_clock_us'] を渡すと、
+                ラウンド境界で時計も途切れなくなる。None なら 0 から。
+                heating_rate_* が 0 でないときは、これを渡さないと background
+                heating がラウンドごとに t=0 から測り直しになる点に注意。
 
         Returns:
             CompileResult: timesteps（並列化済み）と統計情報
         """
+        _seed = initial_phonons is not None or initial_clock_us is not None
+
         def _seeded_state(planner):
             # plan() 内の state 構築と同一 + フォノン辞書の事前登録
             # (_init_phonon は未登録イオンのみ 0 化するため上書きされない)
             st = QCCDState(architecture=self.architecture)
             st.phonon_params = dict(planner.phonon_params)
-            st.phonon_axial.update(initial_phonons.get('axial', {}))
-            st.phonon_transversal.update(initial_phonons.get('transversal', {}))
-            st.phonon_transversal2.update(initial_phonons.get('transversal2', {}))
+            if initial_phonons is not None:
+                st.phonon_axial.update(initial_phonons.get('axial', {}))
+                st.phonon_transversal.update(initial_phonons.get('transversal', {}))
+                st.phonon_transversal2.update(
+                    initial_phonons.get('transversal2', {}))
             for _ion, _zone in initial_placement.items():
                 st.place_ion_any(_ion, _zone)
+            if initial_clock_us is not None:
+                st.clock_us = float(initial_clock_us)
             return st
         # 複数 LIZ 用の partition を MovementPlanner に渡す
         self._planner.partition = partition
@@ -2714,7 +2726,7 @@ class QCCDCompiler:
                                            time_params=self._time_params)
             planner1.partition = partition
             planner1._record_windows = True
-            if initial_phonons is not None:
+            if _seed:
                 planner1.plan(dag, dict(initial_placement),
                               state=_seeded_state(planner1))
             else:
@@ -2722,7 +2734,7 @@ class QCCDCompiler:
             self._planner.window_table = planner1._recorded_windows
 
         # Phase 1: 平坦なAtomicOp列を生成
-        if initial_phonons is not None:
+        if _seed:
             flat_ops = self._planner.plan(dag, initial_placement,
                                           state=_seeded_state(self._planner))
         else:

@@ -9,6 +9,7 @@ Output: results/noise_injection/distance_scan_{timestamp}.{json,png}
 Usage:
     python experiments/exp_distance_scan.py --shots 50000
     python experiments/exp_distance_scan.py --distances 3 5 7 --rounds 3
+    python experiments/exp_distance_scan.py --rounds 5 --carry-phonons
 """
 
 import sys
@@ -58,7 +59,8 @@ DISTANCE_CIRCUITS = {
 }
 
 
-def _compile_round(circuit_name, initial_placement, arch, initial_zone_contents=None):
+def _compile_round(circuit_name, initial_placement, arch, initial_zone_contents=None,
+                   initial_phonons=None, initial_clock_us=None):
     mod = __import__(circuit_name)
     program = parse(mod.CIRCUIT)
     dag = DAGBuilder(program, stabilizer_parallel=False).build()
@@ -69,13 +71,37 @@ def _compile_round(circuit_name, initial_placement, arch, initial_zone_contents=
                 ordered[ion_id] = zone_id
         initial_placement = ordered
     compiler = QCCDCompiler(arch, config=CompilerConfig())
-    result = compiler.compile(dag, initial_placement)
+    result = compiler.compile(dag, initial_placement,
+                              initial_phonons=initial_phonons,
+                              initial_clock_us=initial_clock_us)
     return result
+
+
+def _carry_over_from(result):
+    """CompileResult から次ラウンドへ渡す (initial_phonons, initial_clock_us)。
+
+    initial_phonons は compile() が受ける {'axial': {...}, 'transversal': {...},
+    'transversal2': {...}} 形式 (hackathon/make_test_circuits.compile_rounds と同じ)。
+    フォノン追跡が無効 (phonon_data が None) なら (None, None) を返す。
+    """
+    pd = result.phonon_data
+    if not pd:
+        return None, None
+    phonons = {'axial': pd.get('per_ion_axial', {}),
+               'transversal': pd.get('per_ion_transversal', {}),
+               'transversal2': pd.get('per_ion_transversal2', {})}
+    return phonons, pd.get('planning_clock_us', 0.0)
 
 
 def build_noisy_circuit(forward, reverse, rounds, observable, mode='lumped',
                         override_n_bar=None, phonon_scale=1.0,
-                        warn_on_clip=True):
+                        warn_on_clip=True, carry_phonons=False):
+    """
+    Args:
+        carry_phonons: True なら QEC ラウンド境界でフォノン数と計画時近似時計を
+            0 にリセットせず、前ラウンドの最終値を次ラウンドの初期値にする。
+            False (既定) は論文設定 (ラウンドごとに 0 から再出発)。
+    """
     fwd_mod = __import__(forward)
     half = (len(fwd_mod.DATA_QUBITS) + 1) // 2
     mem_cap = max(20, half + len(fwd_mod.ANCILLA_QUBITS) + 4)
@@ -88,13 +114,19 @@ def build_noisy_circuit(forward, reverse, rounds, observable, mode='lumped',
     results = []
     current_placement = initial
     current_zone_contents = None
+    current_phonons = None
+    current_clock_us = None
     for r in range(1, rounds + 1):
         circuit_name = forward if r % 2 == 1 else reverse
         result = _compile_round(circuit_name, current_placement, arch,
-                                initial_zone_contents=current_zone_contents)
+                                initial_zone_contents=current_zone_contents,
+                                initial_phonons=current_phonons,
+                                initial_clock_us=current_clock_us)
         results.append(result)
         current_placement = result.final_placement
         current_zone_contents = result.final_zone_contents
+        if carry_phonons:
+            current_phonons, current_clock_us = _carry_over_from(result)
 
     circuit = recompile_multi_round(results, observable_column=observable)
 
@@ -148,6 +180,11 @@ def main():
     parser.add_argument('--quiet-clip', action='store_true',
                         help='lookup table 上限超過の per-gate 警告を抑制し、'
                              '距離ごとの 1 行サマリだけ表示する')
+    parser.add_argument('--carry-phonons', action='store_true',
+                        help='QEC ラウンド境界でフォノン数と計画時近似時計を '
+                             '0 にリセットせず、前ラウンドの最終値を引き継ぐ。'
+                             '既定 (リセットあり) は加熱の効果を下限に見積もる'
+                             '論文設定なので、こちらが上限側になる。')
     args = parser.parse_args()
 
     override_n_bar = 0.01 if args.no_heating else None
@@ -159,6 +196,8 @@ def main():
         label_suffix = f'_scale{phonon_scale}'
     else:
         label_suffix = ''
+    if args.carry_phonons:
+        label_suffix += '_carry'
 
     timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
     outdir = Path(args.outdir)
@@ -176,6 +215,9 @@ def main():
         ),
         'override_n_bar': override_n_bar,
         'phonon_scale': phonon_scale,
+        'carry_phonons': args.carry_phonons,
+        'round_boundary': ('carry over previous round final phonons + clock'
+                           if args.carry_phonons else 'reset to zero'),
         'results': [],
     }
 
@@ -188,7 +230,8 @@ def main():
         noisy, results = build_noisy_circuit(
             fwd, rev, args.rounds, obs,
             override_n_bar=override_n_bar, phonon_scale=phonon_scale,
-            warn_on_clip=not args.quiet_clip)
+            warn_on_clip=not args.quiet_clip,
+            carry_phonons=args.carry_phonons)
         # Quick info
         n_qubits = noisy.num_qubits
         n_inst = sum(1 for _ in noisy)
@@ -237,6 +280,8 @@ def main():
         title = f'error vs distance (heating x{phonon_scale})'
     else:
         title = 'error vs distance'
+    if args.carry_phonons:
+        title += ' (phonon carry-over)'
     fig, ax = plt.subplots(figsize=(6, 4.5))
     ax.errorbar(ds, pLs, yerr=errs, fmt='o-', capsize=4, markersize=8,
                 color='C0', label=f'{args.rounds} rounds, {args.shots} shots/d')
